@@ -4,7 +4,8 @@ import type { GitCommitMessage } from "@/lib/types";
 
 const githubEventsBaseUrl = "https://api.github.com/users";
 const maxCommits = 100;
-const maxPages = 10;
+const maxPages = 3;
+const maxFallbackCommitRequests = 35;
 
 const githubHeaders = {
   Accept: "application/vnd.github+json",
@@ -111,7 +112,7 @@ function parseEventCommit(commit: unknown, timestamp: string): GitCommitMessage 
   };
 }
 
-function parseCompareCommit(commit: unknown, fallbackTimestamp: string): GitCommitMessage | null {
+function parseRepositoryCommit(commit: unknown, fallbackTimestamp: string): GitCommitMessage | null {
   if (!isRecord(commit) || typeof commit.sha !== "string" || !isRecord(commit.commit)) {
     return null;
   }
@@ -152,19 +153,16 @@ function extractInlinePushCommits(event: GithubEvent) {
   return commits;
 }
 
-async function fetchComparePushCommits(event: GithubEvent) {
-  const commits: GitCommitMessage[] = [];
-
+async function fetchHeadPushCommit(event: GithubEvent) {
   if (
     typeof event.createdAt !== "string" ||
     typeof event.repo?.url !== "string" ||
-    typeof event.payload?.before !== "string" ||
-    typeof event.payload.head !== "string"
+    typeof event.payload?.head !== "string"
   ) {
-    return commits;
+    return null;
   }
 
-  const response = await fetch(`${event.repo.url}/compare/${event.payload.before}...${event.payload.head}`, {
+  const response = await fetch(`${event.repo.url}/commits/${event.payload.head}`, {
     headers: githubHeaders,
     next: {
       revalidate: 3600,
@@ -176,27 +174,17 @@ async function fetchComparePushCommits(event: GithubEvent) {
   }
 
   if (!response.ok) {
-    return commits;
+    return null;
   }
 
-  const data: unknown = await response.json();
-
-  if (!isRecord(data) || !Array.isArray(data.commits)) {
-    return commits;
-  }
-
-  for (const commit of data.commits) {
-    const parsedCommit = parseCompareCommit(commit, event.createdAt);
-
-    if (parsedCommit) {
-      commits.push(parsedCommit);
-    }
-  }
-
-  return commits;
+  return parseRepositoryCommit(await response.json(), event.createdAt);
 }
 
-async function extractPushCommits(events: GithubEvent[], remainingCommits: number) {
+type FallbackBudget = {
+  remaining: number;
+};
+
+async function extractPushCommits(events: GithubEvent[], remainingCommits: number, fallbackBudget: FallbackBudget) {
   const commits: GitCommitMessage[] = [];
 
   for (const event of events) {
@@ -209,9 +197,22 @@ async function extractPushCommits(events: GithubEvent[], remainingCommits: numbe
     }
 
     const inlineCommits = extractInlinePushCommits(event);
-    const eventCommits = inlineCommits.length > 0 ? inlineCommits : await fetchComparePushCommits(event);
 
-    commits.push(...eventCommits.slice(0, remainingCommits - commits.length));
+    if (inlineCommits.length > 0) {
+      commits.push(...inlineCommits.slice(0, remainingCommits - commits.length));
+      continue;
+    }
+
+    if (fallbackBudget.remaining <= 0) {
+      continue;
+    }
+
+    fallbackBudget.remaining -= 1;
+    const headCommit = await fetchHeadPushCommit(event);
+
+    if (headCommit) {
+      commits.push(headCommit);
+    }
   }
 
   return commits;
@@ -225,6 +226,7 @@ export async function fetchCommits(username: string): Promise<GitCommitMessage[]
   }
 
   const commits: GitCommitMessage[] = [];
+  const fallbackBudget = { remaining: maxFallbackCommitRequests };
 
   for (let page = 1; page <= maxPages && commits.length < maxCommits; page += 1) {
     const response = await fetch(
@@ -255,7 +257,7 @@ export async function fetchCommits(username: string): Promise<GitCommitMessage[]
       break;
     }
 
-    commits.push(...(await extractPushCommits(events, maxCommits - commits.length)));
+    commits.push(...(await extractPushCommits(events, maxCommits - commits.length, fallbackBudget)));
   }
 
   return commits.slice(0, maxCommits);

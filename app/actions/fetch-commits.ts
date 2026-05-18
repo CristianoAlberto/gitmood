@@ -6,6 +6,8 @@ const githubEventsBaseUrl = "https://api.github.com/users";
 const maxCommits = 100;
 const maxPages = 3;
 const maxFallbackCommitRequests = 35;
+const maxRepositoriesFallback = 12;
+const commitsPerRepositoryFallback = 12;
 
 const githubHeaders = {
   Accept: "application/vnd.github+json",
@@ -39,6 +41,10 @@ type GithubPushPayload = {
 
 type GithubRepo = {
   url?: unknown;
+};
+
+type GithubUserRepository = {
+  fullName?: unknown;
 };
 
 type GithubEvent = {
@@ -86,6 +92,16 @@ function parseGithubEvents(value: unknown): GithubEvent[] {
         : undefined,
     };
   });
+}
+
+function parseUserRepositories(value: unknown): GithubUserRepository[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(isRecord).map((repository) => ({
+    fullName: repository.full_name,
+  }));
 }
 
 function parseEventCommit(commit: unknown, timestamp: string): GitCommitMessage | null {
@@ -218,6 +234,75 @@ async function extractPushCommits(events: GithubEvent[], remainingCommits: numbe
   return commits;
 }
 
+async function fetchRepositoryFallbackCommits(username: string, remainingCommits: number) {
+  const commits: GitCommitMessage[] = [];
+  const repositoriesResponse = await fetch(
+    `${githubEventsBaseUrl}/${encodeURIComponent(username)}/repos?per_page=${maxRepositoriesFallback}&sort=pushed&type=owner`,
+    {
+      headers: githubHeaders,
+      next: {
+        revalidate: 3600,
+      },
+    },
+  );
+
+  if (isRateLimited(repositoriesResponse)) {
+    throw new Error(getRateLimitMessage(repositoriesResponse));
+  }
+
+  if (!repositoriesResponse.ok) {
+    return commits;
+  }
+
+  const repositories = parseUserRepositories(await repositoriesResponse.json());
+
+  for (const repository of repositories) {
+    if (commits.length >= remainingCommits) {
+      break;
+    }
+
+    if (typeof repository.fullName !== "string") {
+      continue;
+    }
+
+    const repositoryCommitsResponse = await fetch(
+      `https://api.github.com/repos/${repository.fullName}/commits?author=${encodeURIComponent(username)}&per_page=${commitsPerRepositoryFallback}`,
+      {
+        headers: githubHeaders,
+        next: {
+          revalidate: 3600,
+        },
+      },
+    );
+
+    if (isRateLimited(repositoryCommitsResponse)) {
+      throw new Error(getRateLimitMessage(repositoryCommitsResponse));
+    }
+
+    if (!repositoryCommitsResponse.ok) {
+      continue;
+    }
+
+    const repositoryCommits: unknown = await repositoryCommitsResponse.json();
+
+    if (!Array.isArray(repositoryCommits)) {
+      continue;
+    }
+
+    for (const commit of repositoryCommits) {
+      const parsedCommit = parseRepositoryCommit(commit, new Date().toISOString());
+
+      if (parsedCommit) {
+        commits.push(parsedCommit);
+      }
+    }
+  }
+
+  return commits
+    .toSorted((firstCommit, secondCommit) => secondCommit.timestamp.localeCompare(firstCommit.timestamp))
+    .slice(0, remainingCommits);
+}
+
 export async function fetchCommits(username: string): Promise<GitCommitMessage[]> {
   const normalizedUsername = normalizeUsername(username);
 
@@ -258,6 +343,10 @@ export async function fetchCommits(username: string): Promise<GitCommitMessage[]
     }
 
     commits.push(...(await extractPushCommits(events, maxCommits - commits.length, fallbackBudget)));
+  }
+
+  if (commits.length === 0) {
+    commits.push(...(await fetchRepositoryFallbackCommits(normalizedUsername, maxCommits)));
   }
 
   return commits.slice(0, maxCommits);

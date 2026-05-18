@@ -5,6 +5,8 @@ import type { GitCommitMessage, GitMood, MoodAnalysis } from "@/lib/types";
 
 const model = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
 const groqBaseUrl = "https://api.groq.com/openai/v1";
+const maxCommitsForPrompt = 35;
+const maxCommitMessageLength = 160;
 
 const moods = [
   "ESTRESSADO",
@@ -158,15 +160,34 @@ function parseMoodAnalysis(value: unknown): MoodAnalysis {
   };
 }
 
+function truncateText(value: string, maxLength: number) {
+  const normalizedValue = value.replace(/\s+/g, " ").trim();
+
+  if (normalizedValue.length <= maxLength) {
+    return normalizedValue;
+  }
+
+  return `${normalizedValue.slice(0, maxLength - 1)}…`;
+}
+
+function getCommitDay(timestamp: string) {
+  return timestamp.slice(0, 10);
+}
+
 function buildPrompt(commits: GitCommitMessage[]) {
-  const commitLines = commits.map((commit) => ({
-    sha: commit.sha,
-    mensagem: commit.message,
-    timestamp: commit.timestamp,
-    autor: commit.author,
+  const compactCommits = commits.slice(0, maxCommitsForPrompt).map((commit) => ({
+    d: getCommitDay(commit.timestamp),
+    a: truncateText(commit.author.name, 40),
+    m: truncateText(commit.message, maxCommitMessageLength),
   }));
 
-  return `Analise o humor de um dev com base nos commits públicos abaixo.\n\nRegras:\n- Responda apenas no JSON do schema solicitado.\n- Use português brasileiro.\n- Seja provocativo, mas útil.\n- Não invente fatos fora das mensagens.\n- A pontuação por dia deve ir de 0 a 100, onde 0 é caos total e 100 é fluxo saudável.\n- Agrupe pontuacaoPorDia por data YYYY-MM-DD extraída dos timestamps.\n\nCommits:\n${JSON.stringify(commitLines, null, 2)}`;
+  const commitCountByDay = compactCommits.reduce<Record<string, number>>((days, commit) => {
+    days[commit.d] = (days[commit.d] ?? 0) + 1;
+
+    return days;
+  }, {});
+
+  return `Analise o humor de um dev por commits públicos.\n\nRegras:\n- Retorne apenas JSON válido no schema.\n- Português brasileiro.\n- Headline provocativa, max 60 chars.\n- Evidências curtas, baseadas nas mensagens.\n- Recomendação em 1 parágrafo.\n- pontuacaoPorDia deve usar as datas em commitsPorDia, score 0-100.\n- 0 = caos total, 100 = fluxo saudável.\n\nTotal real de commits coletados: ${commits.length}\nCommits enviados como amostra: ${compactCommits.length}\ncommitsPorDia: ${JSON.stringify(commitCountByDay)}\namostra: ${JSON.stringify(compactCommits)}`;
 }
 
 export async function analyzeMood(commits: GitCommitMessage[]): Promise<MoodAnalysis> {
@@ -196,6 +217,7 @@ export async function analyzeMood(commits: GitCommitMessage[]): Promise<MoodAnal
         schema: moodAnalysisSchema,
       },
     },
+    max_completion_tokens: 1200,
   });
 
   const content = completion.choices[0]?.message.content;

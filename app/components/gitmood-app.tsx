@@ -10,8 +10,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { analyzeMood } from "@/app/actions/analyze-mood";
-import { fetchCommits } from "@/app/actions/fetch-commits";
+import { analyzeUsername } from "@/app/actions/analyze-username";
 import type { MoodAnalysis } from "@/lib/types";
 
 const fadeUp = {
@@ -116,10 +115,6 @@ function Dashboard({ analysis }: DashboardProps) {
   );
 }
 
-function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Não foi possível analisar esse usuário agora.";
-}
-
 export function GitMoodApp() {
   const [username, setUsername] = useState("");
   const [analysis, setAnalysis] = useState<MoodAnalysis | null>(null);
@@ -132,13 +127,14 @@ export function GitMoodApp() {
     setAnalysis(null);
 
     startTransition(async () => {
-      try {
-        const commits = await fetchCommits(username);
-        const moodAnalysis = await analyzeMood(commits);
-        setAnalysis(moodAnalysis);
-      } catch (caughtError) {
-        setError(getErrorMessage(caughtError));
+      const result = await analyzeUsername(username);
+
+      if (result.ok) {
+        setAnalysis(result.analysis);
+        return;
       }
+
+      setError(result.error);
     });
   }
 
